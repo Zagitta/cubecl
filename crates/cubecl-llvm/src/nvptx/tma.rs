@@ -197,7 +197,7 @@ pub(crate) fn wait_group(
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
     let max_pending = op.max_pending(ctx).0;
-    wait(ctx, rw, op.get_operation(), WAIT_GROUP, max_pending)
+    wait_for_groups(ctx, rw, op.get_operation(), WAIT_GROUP, max_pending)
 }
 
 pub(crate) fn wait_group_read(
@@ -207,11 +207,11 @@ pub(crate) fn wait_group_read(
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
     let max_pending = op.max_pending(ctx).0;
-    wait(ctx, rw, op.get_operation(), WAIT_GROUP_READ, max_pending)
+    wait_for_groups(ctx, rw, op.get_operation(), WAIT_GROUP_READ, max_pending)
 }
 
 /// Replaces `op` with a call to the wait `intrinsic` for `max_pending` groups.
-fn wait(
+pub(crate) fn wait_for_groups(
     ctx: &mut Context,
     rw: &mut DialectConversionRewriter,
     op: Ptr<Operation>,

@@ -98,6 +98,33 @@ pub struct CommitCopyAsyncOp {
     pub barrier: Value,
 }
 
+/// Closes a group of the unit's `copy_async` copies issued since its last commit.
+#[cube_op(name = "barrier.copy_async_commit_group")]
+#[result_ty(none)]
+#[op_traits(CanMaterialize, HasSideEffects)]
+pub struct CopyAsyncCommitGroupOp {}
+
+/// Waits until at most `max_pending` of the unit's `copy_async` groups are still running. The
+/// shared memory they wrote is visible to the unit after it, so no access to it may move across.
+#[cube_op(name = "barrier.copy_async_wait_group")]
+#[result_ty(none)]
+#[op_traits(CanMaterialize, HasSideEffects)]
+pub struct CopyAsyncWaitGroupOp {
+    pub max_pending: IndexAttr,
+}
+
+/// Publishes the unit's own copies to the unit alone; a cube synchronization shares them.
+#[op_interface_impl]
+impl Synchronizes for CopyAsyncWaitGroupOp {
+    fn minimum_scope(&self, _ctx: &Context) -> SyncScope {
+        SyncScope::Unit
+    }
+
+    fn maximum_scope(&self, _ctx: &Context) -> SyncScope {
+        SyncScope::Unit
+    }
+}
+
 #[cube_op(name = "barrier.expect_tx")]
 #[result_ty(none)]
 #[op_traits(CanMaterialize, HasSideEffects)]

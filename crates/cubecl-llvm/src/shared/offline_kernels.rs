@@ -802,6 +802,53 @@ pub(crate) fn copy_async_stage_kernel() -> impl CubeKernel {
     )
 }
 
+/// Two stages of `copy_async` copies in two commit groups. The first wait lets the second group
+/// run on; the second waits for it.
+#[cfg(feature = "nvptx")]
+#[cube(launch)]
+fn copy_async_groups(input: &[Vector<f32, Const<4>>], output: &mut [Vector<f32, Const<4>>]) {
+    let mut first = Shared::<[Vector<f32, Const<4>>]>::new_aligned_slice(32usize, 16usize);
+    let mut second = Shared::<[Vector<f32, Const<4>>]>::new_aligned_slice(32usize, 16usize);
+    let unit = UNIT_POS as usize;
+
+    cubecl_core::prelude::barrier::copy_async(
+        &input[unit..unit + 1],
+        first.slice_mut(unit, unit + 1),
+        4u32,
+    );
+    let first_loaded = cubecl_core::prelude::barrier::copy_async_commit();
+    cubecl_core::prelude::barrier::copy_async(
+        &input[32 + unit..33 + unit],
+        second.slice_mut(unit, unit + 1),
+        4u32,
+    );
+    let second_loaded = cubecl_core::prelude::barrier::copy_async_commit();
+
+    first_loaded.wait();
+    sync_cube();
+    output[unit] = first[31 - unit];
+    second_loaded.wait();
+    sync_cube();
+    output[32 + unit] = second[31 - unit];
+}
+
+#[cfg(feature = "nvptx")]
+pub(crate) fn copy_async_groups_kernel() -> impl CubeKernel {
+    let mut props = (*device_properties(32)).clone();
+    props.features.copy_async = true;
+    copy_async_groups::CopyAsyncGroups::new(
+        KernelSettings::new(
+            *CubeDim::new_1d(32),
+            ExecutionMode::Unchecked,
+            AddressType::U32,
+        ),
+        Arc::new(props),
+        Arc::new(TargetProperties::default()),
+        BufferCompilationArg { inplace: None },
+        BufferCompilationArg { inplace: None },
+    )
+}
+
 /// A wait on a barrier phase by its parity.
 #[cfg(feature = "nvptx")]
 #[cube(launch)]

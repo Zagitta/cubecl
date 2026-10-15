@@ -10,6 +10,7 @@ use cubecl_macros_internal::cube_op;
 use crate::{
     CanMaterialize, HasSideEffects, Pure,
     dialect::{
+        barrier::{CopyAsyncCommitGroupOp, CopyAsyncWaitGroupOp},
         matrix::{WgmmaCommitGroupOp, WgmmaWaitGroupOp},
         tma::{CommitGroupOp, WaitGroupOp, WaitGroupReadOp},
     },
@@ -23,6 +24,7 @@ impl AsyncGroup {
         match self {
             AsyncGroup::Warpgroup => WgmmaCommitGroupOp::new(ctx).get_operation(),
             AsyncGroup::BulkCopy => CommitGroupOp::new(ctx).get_operation(),
+            AsyncGroup::CopyAsync => CopyAsyncCommitGroupOp::new(ctx).get_operation(),
         }
     }
 
@@ -41,6 +43,9 @@ impl AsyncGroup {
             }
             (AsyncGroup::BulkCopy, WaitUntil::Complete) => {
                 WaitGroupOp::new(ctx, max_pending).get_operation()
+            }
+            (AsyncGroup::CopyAsync, _) => {
+                CopyAsyncWaitGroupOp::new(ctx, max_pending).get_operation()
             }
         }
     }

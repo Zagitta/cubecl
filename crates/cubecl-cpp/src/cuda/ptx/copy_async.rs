@@ -1,13 +1,18 @@
 use cubecl_core::{
     self as cubecl,
     frontend::barrier::Barrier,
-    ir::dialect::barrier::{CommitCopyAsyncOp, CopyAsyncOp},
+    ir::dialect::barrier::{
+        CommitCopyAsyncOp, CopyAsyncCommitGroupOp, CopyAsyncOp, CopyAsyncWaitGroupOp,
+    },
     prelude::*,
 };
 use pliron::{derive::op_interface_impl, value::Value};
 
 use crate::{
-    cuda::ptx::{barrier_native_handle, generic_to_shared},
+    cuda::{
+        cuda_op,
+        ptx::{barrier_native_handle, generic_to_shared},
+    },
     shared::lowering::LowerOp,
     target::Cuda,
 };
@@ -76,3 +81,11 @@ impl LowerOp<Cuda> for CommitCopyAsyncOp {
         vec![]
     }
 }
+
+cuda_op!(CopyAsyncCommitGroupOp, |_, _| {
+    r#"asm volatile("cp.async.commit_group;" ::: "memory");"#.into()
+});
+cuda_op!(CopyAsyncWaitGroupOp, |op, ctx| {
+    let max_pending = op.max_pending(ctx).0;
+    format!(r#"asm volatile("cp.async.wait_group {max_pending};" ::: "memory");"#)
+});

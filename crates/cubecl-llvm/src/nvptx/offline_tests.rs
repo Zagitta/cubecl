@@ -486,6 +486,18 @@ fn ampere_copies_complete_on_an_mbarrier() {
     );
 }
 
+/// A wait on the older of two `copy_async` groups lets the newer one run on: the waits count
+/// the groups committed after theirs.
+#[test]
+fn copy_async_groups_wait_for_the_older_group_only() {
+    let ptx = ptx_of(
+        crate::shared::offline_kernels::copy_async_groups_kernel(),
+        80,
+    );
+    assert_eq!(ptx.matches("cp.async.commit_group").count(), 2, "{ptx}");
+    assert_eq!(group_waits(&ptx, "cp.async.wait_group"), [1, 0], "{ptx}");
+}
+
 /// Ampere waits on a parity with `test_wait.parity`, from PTX 7.1. Under the PTX 7.0 of a CUDA
 /// 11.0 driver it has no such wait, and the kernel is refused rather than handed to `ptxas`.
 #[test]

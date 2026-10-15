@@ -16,6 +16,10 @@ pub enum AsyncGroup {
     /// read their shared memory, which may then be written again. Their writes to global memory
     /// may still be in flight, and are visible once the kernel ends.
     BulkCopy,
+    /// Ampere's `cp.async` copies from global to shared memory. A group completes once its
+    /// copies wrote shared memory, visible to the unit that issued them; a cube synchronization
+    /// after the wait shares them with the other units.
+    CopyAsync,
 }
 
 /// What a wait on a group waits for.

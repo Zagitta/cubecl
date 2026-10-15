@@ -18,16 +18,19 @@
 
 use crate::{
     nvptx::{
-        address::NvptxSpace, inline_asm::InlineAsm, ptx_version::PtxVersion,
-        tma::no_multicast_or_cache_hint,
+        address::NvptxSpace,
+        inline_asm::InlineAsm,
+        ptx_version::PtxVersion,
+        tma::{no_multicast_or_cache_hint, wait_for_groups},
     },
     prelude::*,
     shared::to_llvm::ty::pointee_size,
 };
 use cubecl_core::ir::{
     dialect::barrier::{
-        ArriveAndExpectTxOp, ArriveAndWaitOp, ArriveOp, CommitCopyAsyncOp, CopyAsyncOp, ExpectTxOp,
-        InitOp, MemCopyAsyncOp, MemCopyAsyncTxOp, WaitOp, WaitParityOp,
+        ArriveAndExpectTxOp, ArriveAndWaitOp, ArriveOp, CommitCopyAsyncOp, CopyAsyncCommitGroupOp,
+        CopyAsyncOp, CopyAsyncWaitGroupOp, ExpectTxOp, InitOp, MemCopyAsyncOp, MemCopyAsyncTxOp,
+        WaitOp, WaitParityOp,
     },
     nvidia::SmArch,
     types::barrier::{BarrierLevel, BarrierType},
@@ -41,6 +44,8 @@ const ARRIVE_COUNT: &str = "llvm.nvvm.mbarrier.arrive.scope.cta.space.cta";
 // Ampere's arrival, which has no scope or count operand and arrives once.
 const ARRIVE_ONCE: &str = "llvm.nvvm.mbarrier.arrive.shared";
 const COPY_ASYNC_ARRIVE: &str = "llvm.nvvm.cp.async.mbarrier.arrive.shared";
+const COPY_ASYNC_COMMIT_GROUP: &str = "llvm.nvvm.cp.async.commit.group";
+const COPY_ASYNC_WAIT_GROUP: &str = "llvm.nvvm.cp.async.wait.group";
 const EXPECT_TX: &str = "llvm.nvvm.mbarrier.expect.tx.scope.cta.space.cta";
 const BULK_GLOBAL_TO_SHARED: &str = "llvm.nvvm.cp.async.bulk.global.to.shared.cluster";
 
@@ -381,6 +386,35 @@ pub(crate) fn commit_copy_async(
     call_void(ctx, rw, COPY_ASYNC_ARRIVE, vec![barrier]);
     rw.erase_operation(ctx, op.get_operation());
     Ok(())
+}
+
+/// Closes a group of the unit's `cp.async` copies.
+pub(crate) fn copy_async_commit_group(
+    op: &CopyAsyncCommitGroupOp,
+    ctx: &mut Context,
+    rw: &mut DialectConversionRewriter,
+    _info: &OperandsInfo,
+) -> Result<()> {
+    call_void(ctx, rw, COPY_ASYNC_COMMIT_GROUP, vec![]);
+    rw.erase_operation(ctx, op.get_operation());
+    Ok(())
+}
+
+/// Waits until at most `max_pending` of the unit's `cp.async` groups still run.
+pub(crate) fn copy_async_wait_group(
+    op: &CopyAsyncWaitGroupOp,
+    ctx: &mut Context,
+    rw: &mut DialectConversionRewriter,
+    _info: &OperandsInfo,
+) -> Result<()> {
+    let max_pending = op.max_pending(ctx).0;
+    wait_for_groups(
+        ctx,
+        rw,
+        op.get_operation(),
+        COPY_ASYNC_WAIT_GROUP,
+        max_pending,
+    )
 }
 
 /// A one-dimensional bulk copy of `source_length` elements from global to shared memory, which

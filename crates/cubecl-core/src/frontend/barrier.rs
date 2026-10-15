@@ -419,7 +419,7 @@ impl Barrier {
 
 /// Copy the source slice in global memory to destination in shared memory with a low level async
 /// copy. This only copies up to 128 bits/16 bytes, and does not synchronize. Use
-/// `barrier.copy_async_arrive` to make the reads visible.
+/// [`Barrier::commit_copy_async`] or [`copy_async_commit`] to make the reads visible.
 /// `copy_size` is in terms of elements to simplify copying between different vector sizes.
 ///
 /// # Safety
@@ -460,7 +460,7 @@ pub mod copy_async {
 
 /// Copy the source slice in global memory to destination in shared memory with a low level async
 /// copy. This only copies up to 128 bits/16 bytes, and does not synchronize. Use
-/// `barrier.copy_async_arrive` to make the reads visible.
+/// [`Barrier::commit_copy_async`] or [`copy_async_commit`] to make the reads visible.
 /// `copy_size` is in terms of elements to simplify copying between different vector sizes.
 ///
 /// Will only copy the length of the source slice, and zero fill the rest. Source length must be
@@ -505,6 +505,35 @@ pub mod copy_async_checked {
         );
 
         scope.register(&mem_copy);
+    }
+}
+
+/// Closes a group of the `copy_async` copies this unit issued since its last commit, and returns
+/// it as pending work. Waiting on it makes the group's copies visible to this unit; a
+/// [`sync_cube`] after the wait shares them with the other units.
+///
+/// This is the other way for copies to complete than [`Barrier::commit_copy_async`]: no
+/// barrier, and a wait that lets the newer groups run on, so a pipeline can keep loading the
+/// next stages while it waits for the current one.
+///
+/// ```rust, ignore
+/// copy_async(source, stage, 8u32);
+/// let stage_loaded = copy_async_commit();
+/// // ... issue and commit the next stages ...
+/// stage_loaded.wait();
+/// sync_cube();
+/// ```
+pub fn copy_async_commit() -> Pending<()> {
+    unexpanded!()
+}
+
+pub mod copy_async_commit {
+    use super::*;
+    use crate::frontend::pending::PendingExpand;
+    use cubecl_ir::types::pending::AsyncGroup;
+
+    pub fn expand(scope: &Scope) -> PendingExpand<()> {
+        PendingExpand::commit(scope, AsyncGroup::CopyAsync, ())
     }
 }
 

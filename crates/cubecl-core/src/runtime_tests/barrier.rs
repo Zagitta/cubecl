@@ -1,4 +1,7 @@
-use crate::{self as cubecl, as_bytes, frontend::barrier::copy_async};
+use crate::{
+    self as cubecl, as_bytes,
+    frontend::barrier::{copy_async, copy_async_commit},
+};
 use alloc::vec::Vec;
 use barrier::Barrier;
 use cubecl::prelude::*;
@@ -89,6 +92,65 @@ pub fn test_async_copy<R: Runtime, F: Float + CubeElement>(client: Client) {
     let actual = F::from_bytes(&actual);
 
     assert_eq!(actual, [F::new(2.0), F::new(3.0)]);
+}
+
+/// Two stages loaded in two `copy_async` groups of two elements per unit, which every element
+/// type fills a `cp.async` of at least 4 bytes with. The first wait lets the second group run
+/// on, then each unit reads what another unit copied.
+#[cube(launch)]
+pub fn async_copy_group_test<F: Float, N: Size>(
+    input: &[Vector<F, N>],
+    output: &mut [Vector<F, N>],
+) {
+    let mut first = Shared::new_aligned_slice(64usize, 16usize);
+    let mut second = Shared::new_aligned_slice(64usize, 16usize);
+    let at = UNIT_POS as usize * 2;
+
+    copy_async(&input[at..at + 2], &mut first[at..at + 2], 2u32);
+    let first_loaded = copy_async_commit();
+    copy_async(&input[64 + at..66 + at], &mut second[at..at + 2], 2u32);
+    let second_loaded = copy_async_commit();
+
+    first_loaded.wait();
+    sync_cube();
+    output[at] = first[63 - at];
+    output[at + 1] = first[62 - at];
+
+    second_loaded.wait();
+    sync_cube();
+    output[64 + at] = second[63 - at];
+    output[65 + at] = second[62 - at];
+}
+
+pub fn test_async_copy_group<R: Runtime, F: Float + CubeElement>(client: Client) {
+    if !client.properties().features.copy_async {
+        // We can't execute the test, skip.
+        return;
+    }
+
+    let values: Vec<F> = (0..128).map(|i| F::from_int(i)).collect();
+    let input = client.create_from_slice(F::as_bytes(&values));
+    let output = client.empty(core::mem::size_of::<F>() * 128);
+
+    unsafe {
+        async_copy_group_test::launch::<F>(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(32),
+            1,
+            BufferArg::from_raw_parts(input, 128),
+            BufferArg::from_raw_parts(output.clone(), 128),
+        )
+    };
+
+    let actual = client.read_one_unchecked(output);
+    let actual = F::from_bytes(&actual);
+    let expected: Vec<F> = (0..64)
+        .map(|i| F::from_int(63 - i))
+        .chain((0..64).map(|i| F::from_int(127 - i)))
+        .collect();
+
+    assert_eq!(actual, expected);
 }
 
 #[cube(launch)]
@@ -279,6 +341,14 @@ macro_rules! testgen_barrier {
         fn test_barrier_async_copy() {
             let client = TestRuntime::client(&Default::default());
             cubecl_core::runtime_tests::barrier::test_async_copy::<TestRuntime, FloatType>(client);
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_barrier_async_copy_group() {
+            let client = TestRuntime::client(&Default::default());
+            cubecl_core::runtime_tests::barrier::test_async_copy_group::<TestRuntime, FloatType>(
+                client,
+            );
         }
 
         #[$crate::runtime_tests::test_log::test]
