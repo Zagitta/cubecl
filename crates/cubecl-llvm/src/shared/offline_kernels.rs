@@ -764,6 +764,71 @@ pub(crate) fn barrier_copies_kernel() -> impl CubeKernel {
     )
 }
 
+/// A pipeline stage the Ampere way: each unit issues `cp.async` copies of one full and one
+/// partial vector, ties them to the cube barrier's phase, and waits on it.
+#[cfg(feature = "nvptx")]
+#[cube(launch)]
+fn copy_async_stage(input: &[Vector<f32, Const<4>>], output: &mut [Vector<f32, Const<4>>]) {
+    let mut stage = Shared::<[Vector<f32, Const<4>>]>::new_aligned_slice(64usize, 16usize);
+    let unit = UNIT_POS as usize;
+    let barrier = Barrier::shared(CUBE_DIM, UNIT_POS == 0);
+    sync_cube();
+
+    let full = stage.slice_mut(unit, unit + 1);
+    cubecl_core::prelude::barrier::copy_async(&input[unit..unit + 1], full, 4u32);
+    let tail = stage.slice_mut(32 + unit, 33 + unit);
+    cubecl_core::prelude::barrier::copy_async_checked(&input[32 + unit..32 + unit + 1], tail, 4u32);
+    barrier.commit_copy_async();
+    barrier.arrive_and_wait();
+
+    output[unit] = stage[63 - unit];
+}
+
+#[cfg(feature = "nvptx")]
+pub(crate) fn copy_async_stage_kernel() -> impl CubeKernel {
+    let mut props = (*device_properties(32)).clone();
+    props.register_opaque_type(cubecl_core::ir::OpaqueType::Barrier);
+    props.features.copy_async = true;
+    copy_async_stage::CopyAsyncStage::new(
+        KernelSettings::new(
+            *CubeDim::new_1d(32),
+            ExecutionMode::Unchecked,
+            AddressType::U32,
+        ),
+        Arc::new(props),
+        Arc::new(TargetProperties::default()),
+        BufferCompilationArg { inplace: None },
+        BufferCompilationArg { inplace: None },
+    )
+}
+
+/// A wait on a barrier phase by its parity.
+#[cfg(feature = "nvptx")]
+#[cube(launch)]
+fn parity_wait(output: &mut [u32]) {
+    let barrier = Barrier::shared(CUBE_DIM, UNIT_POS == 0);
+    sync_cube();
+    let _token = barrier.arrive();
+    barrier.wait_parity(0u32);
+    output[UNIT_POS as usize] = UNIT_POS;
+}
+
+#[cfg(feature = "nvptx")]
+pub(crate) fn parity_wait_kernel() -> impl CubeKernel {
+    let mut props = (*device_properties(32)).clone();
+    props.register_opaque_type(cubecl_core::ir::OpaqueType::Barrier);
+    parity_wait::ParityWait::new(
+        KernelSettings::new(
+            *CubeDim::new_1d(32),
+            ExecutionMode::Unchecked,
+            AddressType::U32,
+        ),
+        Arc::new(props),
+        Arc::new(TargetProperties::default()),
+        BufferCompilationArg { inplace: None },
+    )
+}
+
 /// How a kernel of [`group_waits`] commits and waits.
 #[cfg(feature = "nvptx")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

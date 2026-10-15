@@ -135,12 +135,21 @@ fn compile(
     kernel: impl CubeKernel,
     arch: u32,
 ) -> Result<PlironArtifact, cubecl_runtime::compiler::CompilationError> {
+    compile_for_driver(kernel, arch, 12080)
+}
+
+/// What compiling `kernel` for `sm_{arch}` gives, in the PTX version a CUDA `driver` loads.
+fn compile_for_driver(
+    kernel: impl CubeKernel,
+    arch: u32,
+    driver: i32,
+) -> Result<PlironArtifact, cubecl_runtime::compiler::CompilationError> {
     let mut compiler = PlironCompiler {
         target: LlvmTarget::Nvptx,
     };
     let options = PlironOptions {
         sm_arch: Some(SmArch::new(arch, false)),
-        ptx_version: PtxVersion::for_driver(12080),
+        ptx_version: PtxVersion::for_driver(driver),
         ..Default::default()
     };
     compiler.compile(kernel.define(), &options)
@@ -446,6 +455,68 @@ fn a_tma_load_completes_on_an_mbarrier() {
     assert!(ptx.contains("mbarrier.expect_tx"), "{ptx}");
     assert!(ptx.contains("mbarrier.arrive"), "{ptx}");
     assert!(ptx.contains("mbarrier.try_wait.shared::cta.b64"), "{ptx}");
+}
+
+/// On Ampere a stage of `cp.async` copies completes on the barrier through
+/// `cp.async.mbarrier.arrive`, and the units arrive and spin on `test_wait`: `try_wait` and the
+/// scoped arrival are Hopper's.
+#[test]
+fn ampere_copies_complete_on_an_mbarrier() {
+    let ptx = ptx_of(
+        crate::shared::offline_kernels::copy_async_stage_kernel(),
+        80,
+    );
+    assert!(ptx.contains("cp.async.cg.shared.global [%"), "{ptx}");
+    assert!(
+        ptx.lines().any(
+            |line| line.contains("cp.async.cg.shared.global") && line.matches(',').count() == 3
+        ),
+        "the checked copy passes its source size:\n{ptx}"
+    );
+    assert!(ptx.contains("cp.async.mbarrier.arrive.shared.b64"), "{ptx}");
+    assert!(
+        ptx.lines()
+            .any(|line| line.trim_start().starts_with("mbarrier.arrive.shared.b64")),
+        "the units arrive with Ampere's unscoped arrival:\n{ptx}"
+    );
+    assert!(ptx.contains("mbarrier.test_wait.shared.b64"), "{ptx}");
+    assert!(
+        !ptx.contains("try_wait") && !ptx.contains(".release.cta"),
+        "{ptx}"
+    );
+}
+
+/// Ampere waits on a parity with `test_wait.parity`, from PTX 7.1. Under the PTX 7.0 of a CUDA
+/// 11.0 driver it has no such wait, and the kernel is refused rather than handed to `ptxas`.
+#[test]
+fn an_ampere_parity_wait_needs_ptx_7_1() {
+    let ptx = ptx_of(crate::shared::offline_kernels::parity_wait_kernel(), 80);
+    assert!(
+        ptx.contains("mbarrier.test_wait.parity.shared.b64"),
+        "{ptx}"
+    );
+
+    let old_driver = compile_for_driver(
+        crate::shared::offline_kernels::parity_wait_kernel(),
+        80,
+        11000,
+    );
+    let err = old_driver
+        .err()
+        .expect("the parity wait should be refused under PTX 7.0");
+    assert!(err.to_string().contains("PTX 7.1"), "{err}");
+}
+
+/// Hopper takes the same copies, and keeps its own arrival and `try_wait`.
+#[test]
+fn hopper_copies_wait_with_try_wait() {
+    let ptx = ptx_of(
+        crate::shared::offline_kernels::copy_async_stage_kernel(),
+        90,
+    );
+    assert!(ptx.contains("cp.async.mbarrier.arrive.shared.b64"), "{ptx}");
+    assert!(ptx.contains("mbarrier.try_wait.shared::cta.b64"), "{ptx}");
+    assert!(!ptx.contains("test_wait"), "{ptx}");
 }
 
 /// Each store is its own bulk group. The first store's wait lets the second's group run on,

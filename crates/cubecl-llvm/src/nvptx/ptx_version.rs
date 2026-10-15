@@ -22,6 +22,11 @@ impl PtxVersion {
             .map(|(_, ptx)| Self(*ptx))
     }
 
+    /// Whether this is PTX `version` or newer, `version` spelled as [`PtxVersion`] spells it.
+    pub fn at_least(self, version: u32) -> bool {
+        self.0 >= version
+    }
+
     /// The NVPTX target feature that selects this version.
     pub fn target_feature(self) -> CString {
         CString::new(format!("+{self}")).expect("the feature has no NUL")

@@ -3,12 +3,12 @@
 //! A GPU runtime's properties come from its C++ backend, which gained each generation's hardware
 //! features as they shipped. The LLVM backend runs ordinary kernels: arithmetic, memory, shared
 //! memory, the plane operations, the two barriers and the matrix instructions it has register
-//! shapes for, plus Hopper's TMA and warpgroup MMA on NVPTX. Everything else is taken away here
-//! rather than left to fail at compile time, because a consumer picks its algorithm off these
-//! properties — cubek's matmul selectors ask for `mma` before they ask anything else — and an
-//! advertisement that cannot be honoured is a launch that fails rather than one that falls back.
-//! The CPU runtime builds its properties from what this backend lowers, so it has nothing to
-//! narrow.
+//! shapes for, plus on NVPTX Ampere's `mbarrier` and `cp.async`, and Hopper's TMA and warpgroup
+//! MMA. Everything else is taken away here rather than left to fail at compile time, because a
+//! consumer picks its algorithm off these properties — cubek's matmul selectors ask for `mma`
+//! before they ask anything else — and an advertisement that cannot be honoured is a launch that
+//! fails rather than one that falls back. The CPU runtime builds its properties from what this
+//! backend lowers, so it has nothing to narrow.
 
 #[cfg(feature = "amdgpu")]
 use cubecl_core::ir::amd::AmdWmma;
@@ -44,6 +44,7 @@ pub fn restrict_features(props: &mut DeviceProperties, target: GpuTarget) {
         #[cfg(feature = "nvptx")]
         GpuTarget::Nvptx { arch } => {
             keep_nvptx_matrix_forms(props);
+            keep_nvptx_barrier(props, arch);
             keep_nvptx_tma(props);
             let configs = crate::nvptx::wgmma::configs(arch);
             props.features.matmul.wgmma.extend(configs.iter().copied());
@@ -52,15 +53,23 @@ pub fn restrict_features(props: &mut DeviceProperties, target: GpuTarget) {
         GpuTarget::AmdGpu { wmma } => {
             keep_amdgpu_matrix_forms(props, wmma);
             remove_tma(props);
+            remove_barrier(props);
         }
     }
     restrict_common(props);
 }
 
-/// Keeps TMA where the device has it: the tiled and im2col tensor copies, the bulk groups, and
-/// the cube barriers they complete on. Every barrier operation lowers to an `mbarrier`
-/// instruction from Hopper, so a device without TMA keeps no barrier either. `im2colWide` is
-/// Blackwell's and has no lowering.
+/// Keeps the cube barrier and `copy_async` where the device has an `mbarrier` and `cp.async`,
+/// both Ampere's: the barrier lowers to the `mbarrier` and `copy_async` to `cp.async`.
+#[cfg(feature = "nvptx")]
+fn keep_nvptx_barrier(props: &mut DeviceProperties, arch: SmArch) {
+    if crate::nvptx::barrier::Mbarrier::of(arch, None).is_none() {
+        remove_barrier(props);
+    }
+}
+
+/// Keeps TMA where the device has it: the tiled and im2col tensor copies and the bulk groups.
+/// `im2colWide` is Blackwell's and has no lowering.
 #[cfg(feature = "nvptx")]
 fn keep_nvptx_tma(props: &mut DeviceProperties) {
     use cubecl_core::ir::features::Tma;
@@ -72,11 +81,16 @@ fn keep_nvptx_tma(props: &mut DeviceProperties) {
     props.features.tma.remove(Tma::Im2colWide);
 }
 
-/// No TMA, and no `mbarrier` behind it.
+/// No TMA.
 fn remove_tma(props: &mut DeviceProperties) {
     props.features.tma = Default::default();
     props.features.types.opaque.remove(&OpaqueType::TensorMap);
+}
+
+/// No cube barrier and no `copy_async`, which arrived together with Ampere's `mbarrier`.
+fn remove_barrier(props: &mut DeviceProperties) {
     props.features.types.opaque.remove(&OpaqueType::Barrier);
+    props.features.copy_async = false;
 }
 
 /// An accumulator the half-precision matrix instructions of NVPTX write.
@@ -174,9 +188,8 @@ fn restrict_common(props: &mut DeviceProperties) {
         props.hardware.min_tensor_cores_dim = None;
     }
 
-    // No clusters, and no `copy_async` (`cp.async`). `memcpy_async` lowers with the barriers.
+    // No clusters.
     props.features.cube_cluster = false;
-    props.features.copy_async = false;
 
     // `bf16` atomics have no test on any target this backend lowers for, so they are not
     // offered until one checks the read-modify-write LLVM expands them into.
@@ -370,9 +383,12 @@ mod nvptx_tma_tests {
     use crate::shared::offline_kernels::device_properties;
     use cubecl_core::ir::features::Tma;
 
-    fn restricted(tma: &[Tma]) -> DeviceProperties {
+    /// What a device of `sm` with `tma` keeps, its C++ backend having advertised the barriers
+    /// and `copy_async`.
+    fn restricted(sm: u32, tma: &[Tma]) -> DeviceProperties {
         let mut props = (*device_properties(32)).clone();
         props.register_opaque_type(OpaqueType::Barrier);
+        props.features.copy_async = true;
         if !tma.is_empty() {
             props.register_opaque_type(OpaqueType::TensorMap);
         }
@@ -382,7 +398,7 @@ mod nvptx_tma_tests {
         restrict_features(
             &mut props,
             GpuTarget::Nvptx {
-                arch: SmArch::new(90, true),
+                arch: SmArch::new(sm, true),
             },
         );
         props
@@ -392,12 +408,12 @@ mod nvptx_tma_tests {
     /// `im2colWide`, which has no lowering.
     #[test]
     fn a_device_with_tma_keeps_it() {
-        let props = restricted(&[Tma::Base, Tma::Im2colWide]);
+        let props = restricted(90, &[Tma::Base, Tma::Im2colWide]);
         assert!(props.features.tma.contains(Tma::Base));
         assert!(!props.features.tma.contains(Tma::Im2colWide));
         assert!(props.features.types.opaque.contains(&OpaqueType::TensorMap));
         assert!(props.features.types.opaque.contains(&OpaqueType::Barrier));
-        assert!(!props.features.copy_async);
+        assert!(props.features.copy_async);
     }
 
     /// Hopper alone gets warpgroup MMA.
@@ -411,12 +427,22 @@ mod nvptx_tma_tests {
         }
     }
 
-    /// Every barrier operation is an `mbarrier` instruction from Hopper, so an older device
-    /// keeps no barrier.
+    /// Ampere has no TMA, but its `mbarrier` and `cp.async` carry the cube barriers and
+    /// `copy_async`.
     #[test]
-    fn a_device_without_tma_keeps_no_barrier() {
-        let props = restricted(&[]);
+    fn ampere_keeps_the_barrier_and_copy_async_without_tma() {
+        let props = restricted(80, &[]);
         assert!(props.features.tma.is_empty());
+        assert!(!props.features.types.opaque.contains(&OpaqueType::TensorMap));
+        assert!(props.features.types.opaque.contains(&OpaqueType::Barrier));
+        assert!(props.features.copy_async);
+    }
+
+    /// Before Ampere there is no `mbarrier`, so no barrier and no `copy_async` either.
+    #[test]
+    fn a_device_before_ampere_keeps_no_barrier() {
+        let props = restricted(75, &[]);
         assert!(!props.features.types.opaque.contains(&OpaqueType::Barrier));
+        assert!(!props.features.copy_async);
     }
 }

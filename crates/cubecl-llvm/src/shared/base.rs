@@ -3,6 +3,7 @@ use crate::amdgpu::{abi::AmdGpuLowering, matrix::CtxWmma};
 #[cfg(feature = "nvptx")]
 use crate::nvptx::{
     abi::NvptxLowering,
+    barrier::{CtxMbarrier, Mbarrier},
     codegen::{MetadataParams, NvptxEntry},
     ptx_version::PtxVersion,
 };
@@ -349,6 +350,7 @@ impl PlironCompiler {
         let mut ctx = kernel.body.into_context().expect("Should be owned scope");
 
         ctx.set_target(LlvmTarget::Nvptx);
+        ctx.set_mbarrier(Mbarrier::of(arch, ptx_version));
         ctx.set_shared_memory_size(0);
         ctx.set_grid_constants(grid_constants);
         let plane_dim = arch.plane_dim();

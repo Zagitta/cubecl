@@ -1,9 +1,15 @@
 //! NVPTX barriers, and the copies that complete on them.
 //!
-//! A cube barrier is Hopper's `mbarrier`, one 64-bit word in shared memory. Arriving returns the
-//! phase it arrived in as a token, and waiting spins on `mbarrier.try_wait` until that phase
-//! completes. A phase completes once both its arrivals and the transaction bytes it expects,
-//! written by TMA and bulk copies, are all in.
+//! A cube barrier is an `mbarrier`, one 64-bit word in shared memory, which Ampere introduced.
+//! Arriving returns the phase it arrived in as a token, and waiting spins until that phase
+//! completes: on `mbarrier.try_wait` from Hopper, which suspends the unit for a while in each
+//! attempt, and on `mbarrier.test_wait` before it. A phase completes once both its arrivals and
+//! the transaction bytes it expects, written by TMA and bulk copies, are all in. Transactions are
+//! Hopper's; Ampere's phases count arrivals alone.
+//!
+//! `copy_async` is Ampere's `cp.async`, a copy of 4, 8 or 16 bytes from global to shared memory
+//! that completes in the background. `commit_copy_async` makes the phase the unit arrives in next
+//! wait for every copy the unit has issued, without counting as an arrival itself.
 //!
 //! `memcpy_async` copies synchronously: each unit's part of the copy is done before the unit
 //! next arrives, and the release of its arrival with the acquire of the wait carries the copy to
@@ -11,15 +17,19 @@
 //! nothing to wait for and its operations are dropped.
 
 use crate::{
-    nvptx::{address::NvptxSpace, inline_asm::InlineAsm, tma::no_multicast_or_cache_hint},
+    nvptx::{
+        address::NvptxSpace, inline_asm::InlineAsm, ptx_version::PtxVersion,
+        tma::no_multicast_or_cache_hint,
+    },
     prelude::*,
     shared::to_llvm::ty::pointee_size,
 };
 use cubecl_core::ir::{
     dialect::barrier::{
-        ArriveAndExpectTxOp, ArriveAndWaitOp, ArriveOp, ExpectTxOp, InitOp, MemCopyAsyncOp,
-        MemCopyAsyncTxOp, WaitOp, WaitParityOp,
+        ArriveAndExpectTxOp, ArriveAndWaitOp, ArriveOp, CommitCopyAsyncOp, CopyAsyncOp, ExpectTxOp,
+        InitOp, MemCopyAsyncOp, MemCopyAsyncTxOp, WaitOp, WaitParityOp,
     },
+    nvidia::SmArch,
     types::barrier::{BarrierLevel, BarrierType},
 };
 use pliron::location::Location;
@@ -28,6 +38,9 @@ use pliron::location::Location;
 // take a count.
 const INIT: &str = "llvm.nvvm.mbarrier.init.shared";
 const ARRIVE_COUNT: &str = "llvm.nvvm.mbarrier.arrive.scope.cta.space.cta";
+// Ampere's arrival, which has no scope or count operand and arrives once.
+const ARRIVE_ONCE: &str = "llvm.nvvm.mbarrier.arrive.shared";
+const COPY_ASYNC_ARRIVE: &str = "llvm.nvvm.cp.async.mbarrier.arrive.shared";
 const EXPECT_TX: &str = "llvm.nvvm.mbarrier.expect.tx.scope.cta.space.cta";
 const BULK_GLOBAL_TO_SHARED: &str = "llvm.nvvm.cp.async.bulk.global.to.shared.cluster";
 
@@ -41,6 +54,68 @@ pub struct UnitBarrierUnsupported;
 #[derive(Debug, Error)]
 #[error("a copy length is an integer, not {0}")]
 pub struct CopyLengthType(String);
+
+#[derive(Debug, Error)]
+#[error("`cp.async` copies 4, 8 or 16 bytes, not {0}")]
+pub struct CopyAsyncLength(usize);
+
+#[derive(Debug, Error)]
+#[error(
+    "transaction bytes on an `mbarrier` are Hopper's; this device's barrier counts arrivals only"
+)]
+pub struct TransactionsUnsupported;
+
+#[derive(Debug, Error)]
+#[error(
+    "waiting on a barrier phase by parity needs PTX 7.1 on Ampere; the driver's PTX version is older"
+)]
+pub struct ParityWaitUnsupported;
+
+#[derive(Debug, Error)]
+#[error(
+    "`copy_async` completes on an `mbarrier`, which only a cube barrier in shared memory is; a \
+     unit barrier has none"
+)]
+pub struct CopyAsyncUnitBarrier;
+
+/// The `mbarrier` an architecture has. Ampere introduced it; Hopper added the scoped forms,
+/// transaction bytes and `try_wait`, which suspends the unit in hardware between attempts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mbarrier {
+    /// `sm_80` to `sm_89`. `parity_wait` is whether the PTX version has `test_wait.parity`,
+    /// from 7.1.
+    Ampere { parity_wait: bool },
+    /// `sm_90` on.
+    Hopper,
+}
+
+impl Mbarrier {
+    /// The `mbarrier` of `arch` under `ptx`, or `None` before Ampere. `ptx` is `None` when
+    /// LLVM picks the version, the oldest `arch` accepts: 7.0 on `sm_80`, 7.1 from `sm_86`.
+    pub fn of(arch: SmArch, ptx: Option<PtxVersion>) -> Option<Self> {
+        match arch.version() {
+            ..80 => None,
+            80..90 => Some(Mbarrier::Ampere {
+                parity_wait: ptx.map_or(arch.version() >= 86, |ptx| ptx.at_least(71)),
+            }),
+            _ => Some(Mbarrier::Hopper),
+        }
+    }
+}
+
+impl CtxMbarrier for Context {}
+
+pub trait CtxMbarrier: ContextExt {
+    fn mbarrier(&self) -> Mbarrier {
+        *self
+            .aux_ty::<Option<Mbarrier>>()
+            .as_ref()
+            .expect("barrier ops are only compiled for devices that have an `mbarrier`")
+    }
+    fn set_mbarrier(&mut self, mbarrier: Option<Mbarrier>) {
+        self.set_aux_ty(mbarrier);
+    }
+}
 
 /// What a barrier operand is on NVPTX, read off the cube type it was converted from.
 pub(crate) enum Barrier {
@@ -87,19 +162,35 @@ enum Wait {
 impl Wait {
     /// Spins until the phase completes. The label is scoped to the braces, so a kernel may hold
     /// any number of these, and the memory clobber keeps the reads the barrier guards after it.
-    fn emit(self, ctx: &mut Context, rw: &mut DialectConversionRewriter, barrier: Value) {
+    fn emit(
+        self,
+        ctx: &mut Context,
+        rw: &mut DialectConversionRewriter,
+        barrier: Value,
+        loc: Location,
+    ) -> Result<()> {
         let i32_ty = i32_ty(ctx);
         let address = llvm::PtrToIntOp::new(ctx, barrier, i32_ty);
         let address = insert(ctx, rw, &address);
 
+        // `test_wait` and the plain `.shared` space are what Ampere's PTX has.
+        let (test, space) = match ctx.mbarrier() {
+            Mbarrier::Hopper => ("try_wait", "shared::cta"),
+            Mbarrier::Ampere { parity_wait } => {
+                if matches!(self, Wait::Parity(_)) && !parity_wait {
+                    return input_err!(loc, ParityWaitUnsupported);
+                }
+                ("test_wait", "shared")
+            }
+        };
         let mut asm = InlineAsm::new(Vec::new()).clobbers_memory();
         let address = asm.input(address);
         let (test, phase) = match self {
-            Wait::Token(token) => ("mbarrier.try_wait.shared::cta.b64", asm.input(token)),
+            Wait::Token(token) => (format!("mbarrier.{test}.{space}.b64"), asm.input(token)),
             Wait::Parity(parity) => {
                 let parity = u32_operand(ctx, rw, parity);
                 (
-                    "mbarrier.try_wait.parity.shared::cta.b64",
+                    format!("mbarrier.{test}.parity.{space}.b64"),
                     asm.input(parity),
                 )
             }
@@ -108,6 +199,7 @@ impl Wait {
             "{{\n.reg .pred done;\nwait:\n{test} done, [{address}], {phase};\n@!done bra wait;\n}}"
         );
         asm.emit(ctx, rw, &template);
+        Ok(())
     }
 }
 
@@ -147,6 +239,9 @@ pub(crate) fn arrive_and_expect_tx(
     rw: &mut DialectConversionRewriter,
     info: &OperandsInfo,
 ) -> Result<()> {
+    if ctx.mbarrier() != Mbarrier::Hopper {
+        return input_err!(op.loc(ctx), TransactionsUnsupported);
+    }
     let token = match Barrier::new(ctx, rw, info, op.barrier(ctx)) {
         Barrier::Cube(barrier) => {
             let count = u32_operand(ctx, rw, op.arrive_count_update(ctx));
@@ -167,6 +262,9 @@ pub(crate) fn expect_tx(
     rw: &mut DialectConversionRewriter,
     info: &OperandsInfo,
 ) -> Result<()> {
+    if ctx.mbarrier() != Mbarrier::Hopper {
+        return input_err!(op.loc(ctx), TransactionsUnsupported);
+    }
     if let Barrier::Cube(barrier) = Barrier::new(ctx, rw, info, op.barrier(ctx)) {
         let bytes = u32_operand(ctx, rw, op.transaction_count_update(ctx));
         call_void(ctx, rw, EXPECT_TX, vec![barrier, bytes]);
@@ -182,7 +280,7 @@ pub(crate) fn wait(
     info: &OperandsInfo,
 ) -> Result<()> {
     if let Barrier::Cube(barrier) = Barrier::new(ctx, rw, info, op.barrier(ctx)) {
-        Wait::Token(op.token(ctx)).emit(ctx, rw, barrier);
+        Wait::Token(op.token(ctx)).emit(ctx, rw, barrier, op.loc(ctx))?;
     }
     rw.erase_operation(ctx, op.get_operation());
     Ok(())
@@ -195,7 +293,7 @@ pub(crate) fn wait_parity(
     info: &OperandsInfo,
 ) -> Result<()> {
     if let Barrier::Cube(barrier) = Barrier::new(ctx, rw, info, op.barrier(ctx)) {
-        Wait::Parity(op.phase(ctx)).emit(ctx, rw, barrier);
+        Wait::Parity(op.phase(ctx)).emit(ctx, rw, barrier, op.loc(ctx))?;
     }
     rw.erase_operation(ctx, op.get_operation());
     Ok(())
@@ -209,7 +307,7 @@ pub(crate) fn arrive_and_wait(
 ) -> Result<()> {
     if let Barrier::Cube(barrier) = Barrier::new(ctx, rw, info, op.barrier(ctx)) {
         let token = arrive(ctx, rw, barrier);
-        Wait::Token(token).emit(ctx, rw, barrier);
+        Wait::Token(token).emit(ctx, rw, barrier, op.loc(ctx))?;
     }
     rw.erase_operation(ctx, op.get_operation());
     Ok(())
@@ -241,6 +339,50 @@ pub(crate) fn memcpy_async(
     Ok(())
 }
 
+/// A `cp.async` of `copy_length` bytes from global to shared memory. A checked copy reads only
+/// `source_length` bytes and fills the rest of the destination with zeros.
+pub(crate) fn copy_async(
+    op: &CopyAsyncOp,
+    ctx: &mut Context,
+    rw: &mut DialectConversionRewriter,
+    _info: &OperandsInfo,
+) -> Result<()> {
+    let bytes = op.copy_length(ctx).0;
+    // `.cg` caches in L2 only, and copies only 16 bytes.
+    let cache = match bytes {
+        16 => "cg",
+        4 | 8 => "ca",
+        _ => return input_err!(op.loc(ctx), CopyAsyncLength(bytes)),
+    };
+    let destination = NvptxSpace::Shared.cast(ctx, rw, op.destination(ctx));
+    let source = NvptxSpace::Global.cast(ctx, rw, op.source(ctx));
+    let mut name = format!("llvm.nvvm.cp.async.{cache}.shared.global.{bytes}");
+    let mut args = vec![destination, source];
+    if op.checked(ctx).0 {
+        name.push_str(".s");
+        args.push(u32_operand(ctx, rw, op.source_length(ctx)));
+    }
+    call_void(ctx, rw, &name, args);
+
+    rw.erase_operation(ctx, op.get_operation());
+    Ok(())
+}
+
+/// Ties the unit's `cp.async` copies to the barrier's current phase.
+pub(crate) fn commit_copy_async(
+    op: &CommitCopyAsyncOp,
+    ctx: &mut Context,
+    rw: &mut DialectConversionRewriter,
+    info: &OperandsInfo,
+) -> Result<()> {
+    let Barrier::Cube(barrier) = Barrier::new(ctx, rw, info, op.barrier(ctx)) else {
+        return input_err!(op.loc(ctx), CopyAsyncUnitBarrier);
+    };
+    call_void(ctx, rw, COPY_ASYNC_ARRIVE, vec![barrier]);
+    rw.erase_operation(ctx, op.get_operation());
+    Ok(())
+}
+
 /// A one-dimensional bulk copy of `source_length` elements from global to shared memory, which
 /// completes on the barrier as a transaction of the bytes it wrote.
 pub(crate) fn memcpy_async_tx(
@@ -250,6 +392,9 @@ pub(crate) fn memcpy_async_tx(
     info: &OperandsInfo,
 ) -> Result<()> {
     let loc = op.loc(ctx);
+    if ctx.mbarrier() != Mbarrier::Hopper {
+        return input_err!(loc, TransactionsUnsupported);
+    }
     let barrier = Barrier::new(ctx, rw, info, op.barrier(ctx)).mbarrier(loc.clone())?;
     let bytes = copy_bytes(ctx, rw, info, op.source(ctx), op.source_length(ctx), loc)?;
     let destination = NvptxSpace::SharedCluster.cast(ctx, rw, op.destination(ctx));
@@ -269,9 +414,14 @@ fn u32_operand(ctx: &mut Context, rw: &mut DialectConversionRewriter, value: Val
 }
 
 fn arrive(ctx: &mut Context, rw: &mut DialectConversionRewriter, barrier: Value) -> Value {
-    let once = insert_i32_const(ctx, rw, 1);
     let i64_ty = i64_ty(ctx);
-    call_intrinsic(ctx, rw, ARRIVE_COUNT, i64_ty, vec![barrier, once])
+    match ctx.mbarrier() {
+        Mbarrier::Ampere { .. } => call_intrinsic(ctx, rw, ARRIVE_ONCE, i64_ty, vec![barrier]),
+        Mbarrier::Hopper => {
+            let once = insert_i32_const(ctx, rw, 1);
+            call_intrinsic(ctx, rw, ARRIVE_COUNT, i64_ty, vec![barrier, once])
+        }
+    }
 }
 
 /// The token of an arrival on a unit barrier, which no wait reads.
